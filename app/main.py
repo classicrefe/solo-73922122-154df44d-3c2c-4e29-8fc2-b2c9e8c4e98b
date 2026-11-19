@@ -1,7 +1,9 @@
-"""FastAPI 入口：路由、预览令牌缓存、失效管控。"""
+"""FastAPI 入口：路由、预览令牌缓存、失效管控、特征交付打包。"""
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import threading
 import time
 import uuid
@@ -9,12 +11,18 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .db import Database, StaleVersionError
+from .delivery import (
+    MAX_UPLOAD_BYTES,
+    build_packages,
+    read_features_zip,
+    unsafe_case_ids,
+)
 from .models import (
     ActiveInput,
     ValidationError,
@@ -25,14 +33,31 @@ from .models import (
 )
 from .splitter import SplitterError, solve_split
 
-import os
-
 DB_PATH = Path(os.environ.get("SPLIT_DB_PATH",
                               Path(__file__).resolve().parent.parent / "data" / "app.db"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="病例切分平台", version="1.0.0")
+# 交付包（train.zip / eval.zip）与 SQLite 同卷持久化，重启后仍按同一套规则供数
+DELIVERIES_DIR = Path(os.environ.get("SPLIT_DELIVERIES_DIR", DB_PATH.parent / "deliveries"))
+DELIVERIES_DIR.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(title="病例切分平台", version="1.1.0")
 db = Database(str(DB_PATH))
+
+
+def _reconcile_delivery_storage() -> None:
+    """启动对账：清理打包中途崩溃留下的临时目录，以及没有任何数据库记录的
+    孤儿批次目录（文件先于事务写入、事务失败即删；崩溃才会留下孤儿）。
+    有数据库记录的批次目录一律保留，重启后按原规则继续供数或拒绝。"""
+    known = db.delivery_batch_ids()
+    for child in DELIVERIES_DIR.iterdir():
+        if not child.is_dir():
+            continue
+        if child.name.startswith("tmp-") or child.name not in known:
+            shutil.rmtree(child, ignore_errors=True)
+
+
+_reconcile_delivery_storage()
 
 
 # --------------------------------------------------------------------------- #
@@ -96,7 +121,7 @@ class PublishPayload(BaseModel):
 # --------------------------------------------------------------------------- #
 @app.exception_handler(ValidationError)
 async def _validation_handler(_request, exc: ValidationError):
-    return JSONResponse(status_code=400, content={"detail": "输入校验失败", "errors": exc.errors})
+    return JSONResponse(status_code=400, content={"detail": "校验失败", "errors": exc.errors})
 
 
 @app.exception_handler(SplitterError)
@@ -129,6 +154,7 @@ def get_state():
         "patient_count": len({c.patient_id for c in active.cases}),
         "input": active.to_json(),
         "manifests": db.list_manifests(),
+        "deliveries": [_enrich_delivery(b) for b in db.list_deliveries()],
     }
 
 
@@ -282,6 +308,145 @@ def manifest_download(manifest_id: str):
 @app.get("/api/version-log")
 def version_log():
     return {"current_version": db.get_version(), "log": db.version_log()}
+
+
+# --------------------------------------------------------------------------- #
+# 特征打包与交付：选有效清单 + 上传特征 ZIP -> 训练/评估两个 ZIP（同一批次号）
+# --------------------------------------------------------------------------- #
+def _enrich_delivery(batch: Dict[str, Any]) -> Dict[str, Any]:
+    """补充文件系统状态，计算批次是否可下载及其原因。"""
+    batch_dir = DELIVERIES_DIR / batch["batch_id"]
+    files_exist = (batch_dir / "train.zip").is_file() and (batch_dir / "eval.zip").is_file()
+    if batch["superseded"]:
+        status, downloadable = "已被新批次替换", False
+    elif batch["manifest_expired"]:
+        status, downloadable = "清单已失效", False
+    elif not files_exist:
+        status, downloadable = "交付文件缺失", False
+    else:
+        status, downloadable = "有效", True
+    return {
+        **batch,
+        "files_exist": files_exist,
+        "status": status,
+        "downloadable": downloadable,
+    }
+
+
+async def _read_zip_upload(file: UploadFile) -> bytes:
+    chunks, total = [], 0
+    while True:
+        chunk = await file.read(1 << 20)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_UPLOAD_BYTES:
+            raise ValidationError(
+                [f"上传文件超过 {MAX_UPLOAD_BYTES // (1 << 20)} MiB 限制。"])
+        chunks.append(chunk)
+    if total == 0:
+        raise ValidationError(["上传文件为空。"])
+    return b"".join(chunks)
+
+
+@app.post("/api/deliveries")
+async def create_delivery(manifest_id: str = Form(...), file: UploadFile = File(...)):
+    # 1) 清单必须存在且当前有效；失效清单一律不得发布交付包
+    manifest = db.get_manifest(manifest_id)
+    if manifest is None:
+        raise HTTPException(status_code=404, detail="清单不存在。")
+    if manifest["expired"]:
+        raise HTTPException(
+            status_code=409,
+            detail="该清单已失效（切分输入已变动），两包一律不得发布。"
+                   "请重新求解并发布新清单后再打包。",
+        )
+    case_ids = [c["case_id"] for c in manifest["input"]["cases"]]
+    bad = unsafe_case_ids(case_ids)
+    if bad:
+        raise ValidationError([
+            "以下病例号无法作为 ZIP 根目录安全文件名（含非法字符或与元数据文件"
+            "冲突），不能打包：" + "、".join(bad)
+        ])
+    # 2) 整包校验：缺件 / 未知病例 / 同名文件 / 超量 / 非 JSON —— 任一即拒收
+    raw = await _read_zip_upload(file)
+    features = read_features_zip(raw, case_ids)
+    # 3) 构建两包并落盘。全程不持有数据库锁：打包期间其他窗口仍可更正切分输入
+    batch_id = uuid.uuid4().hex
+    tmp_dir = DELIVERIES_DIR / f"tmp-{batch_id}"
+    final_dir = DELIVERIES_DIR / batch_id
+    try:
+        pkgs = build_packages(batch_id, manifest, features, tmp_dir)
+        os.replace(tmp_dir, final_dir)  # 两包一起原子就位
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(final_dir, ignore_errors=True)
+        raise
+    # 4) 两包都已保存成功，才在事务内提交批次记录并开放下载；
+    #    提交时复核清单有效性（打包期间输入可能已被更正）
+    try:
+        replaced = db.commit_delivery_batch(
+            batch_id=batch_id,
+            manifest_id=manifest_id,
+            expected_version=manifest["dataset_version"],
+            train=pkgs["train"],
+            eval=pkgs["eval"],
+        )
+    except Exception:
+        shutil.rmtree(final_dir, ignore_errors=True)  # 未提交成功：两包一律不保留
+        raise
+    # 5) 替换成功后再清理旧批次文件；旧链接由数据库中的 superseded 标记提示失效
+    for old_id in replaced:
+        shutil.rmtree(DELIVERIES_DIR / old_id, ignore_errors=True)
+    batch = _enrich_delivery(db.get_delivery(batch_id))
+    return {"notice": "训练包与评估包均已保存成功，下载已开放。", "batch": batch}
+
+
+@app.get("/api/deliveries")
+def deliveries():
+    return {"deliveries": [_enrich_delivery(b) for b in db.list_deliveries()]}
+
+
+@app.get("/api/deliveries/{batch_id}")
+def delivery_detail(batch_id: str):
+    batch = db.get_delivery(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="交付批次不存在。")
+    return _enrich_delivery(batch)
+
+
+@app.get("/api/deliveries/{batch_id}/download/{package}")
+def delivery_download(batch_id: str, package: str):
+    if package not in ("train", "eval"):
+        raise HTTPException(status_code=404, detail="未知的包类型（应为 train 或 eval）。")
+    batch = db.get_delivery(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="交付批次不存在。")
+    if batch["superseded"]:
+        raise HTTPException(
+            status_code=409,
+            detail="该交付批次已被同一清单的新批次替换，此下载链接已失效。"
+                   "请使用最新批次的下载链接。",
+        )
+    if batch["manifest_expired"]:
+        raise HTTPException(
+            status_code=409,
+            detail="该批次所属清单已失效（切分输入已变动），两包一律不得下载。",
+        )
+    batch_dir = DELIVERIES_DIR / batch_id
+    train_zip = batch_dir / "train.zip"
+    eval_zip = batch_dir / "eval.zip"
+    if not (train_zip.is_file() and eval_zip.is_file()):
+        raise HTTPException(
+            status_code=409,
+            detail="交付文件缺失（两包未同时保存成功），禁止下载。",
+        )
+    path = train_zip if package == "train" else eval_zip
+    return FileResponse(
+        path,
+        media_type="application/zip",
+        filename=f"{package}_features_batch_{batch_id[:8]}.zip",
+    )
 
 
 # 静态前端（最后挂载，避免覆盖 /api 路由）

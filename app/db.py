@@ -65,6 +65,22 @@ class Database:
                     invalidated INTEGER NOT NULL DEFAULT 0,
                     invalidated_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS delivery_batches (
+                    batch_id TEXT PRIMARY KEY,
+                    manifest_id TEXT NOT NULL,
+                    dataset_version INTEGER NOT NULL,
+                    train_count INTEGER NOT NULL,
+                    eval_count INTEGER NOT NULL,
+                    train_bytes INTEGER NOT NULL,
+                    eval_bytes INTEGER NOT NULL,
+                    train_sha256 TEXT NOT NULL,
+                    eval_sha256 TEXT NOT NULL,
+                    train_cases_json TEXT NOT NULL,
+                    eval_cases_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    superseded INTEGER NOT NULL DEFAULT 0,
+                    superseded_at TEXT
+                );
                 """
             )
             row = self._conn.execute("SELECT COUNT(*) AS n FROM state").fetchone()
@@ -278,6 +294,149 @@ class Database:
         manifest = self.get_manifest(manifest_id)
         assert manifest is not None
         return manifest
+
+    # ------------------------------------------------------------------ #
+    # 交付批次（特征打包）
+    # ------------------------------------------------------------------ #
+    def commit_delivery_batch(
+        self,
+        *,
+        batch_id: str,
+        manifest_id: str,
+        expected_version: int,
+        train: Dict[str, Any],
+        eval: Dict[str, Any],
+    ) -> List[str]:
+        """在同一 IMMEDIATE 事务内：核对清单仍有效 -> 作废旧批次 -> 写入新批次。
+
+        调用前两个 ZIP 必须都已落盘（两包都保存成功才允许提交）；若提交时
+        清单已失效（打包期间输入被更正），抛 StaleVersionError，调用方负责
+        删除新文件，上一对有效包不受影响。返回被替换作旧的 batch_id 列表。
+        """
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                current_version = self._conn.execute(
+                    "SELECT dataset_version FROM state WHERE id = 1"
+                ).fetchone()["dataset_version"]
+                m = self._conn.execute(
+                    "SELECT dataset_version, invalidated FROM published_manifests"
+                    " WHERE manifest_id = ?",
+                    (manifest_id,),
+                ).fetchone()
+                if m is None:
+                    raise StaleVersionError("清单不存在，不能发布交付批次。")
+                if (
+                    m["invalidated"]
+                    or m["dataset_version"] != current_version
+                    or current_version != expected_version
+                ):
+                    raise StaleVersionError(
+                        "打包期间切分输入已变动，所选清单已永久失效：本次交付批次"
+                        "不予发布；上一对有效包（如有）不受影响，仍可下载。"
+                    )
+                now = _now()
+                replaced = [
+                    r["batch_id"]
+                    for r in self._conn.execute(
+                        "SELECT batch_id FROM delivery_batches"
+                        " WHERE manifest_id = ? AND superseded = 0",
+                        (manifest_id,),
+                    ).fetchall()
+                ]
+                self._conn.execute(
+                    "UPDATE delivery_batches SET superseded = 1, superseded_at = ?"
+                    " WHERE manifest_id = ? AND superseded = 0",
+                    (now, manifest_id),
+                )
+                self._conn.execute(
+                    "INSERT INTO delivery_batches (batch_id, manifest_id,"
+                    " dataset_version, train_count, eval_count, train_bytes,"
+                    " eval_bytes, train_sha256, eval_sha256, train_cases_json,"
+                    " eval_cases_json, created_at, superseded)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                    (
+                        batch_id,
+                        manifest_id,
+                        current_version,
+                        train["count"],
+                        eval["count"],
+                        train["bytes"],
+                        eval["bytes"],
+                        train["sha256"],
+                        eval["sha256"],
+                        json.dumps(train["cases"], ensure_ascii=False),
+                        json.dumps(eval["cases"], ensure_ascii=False),
+                        now,
+                    ),
+                )
+                self._conn.commit()
+                return replaced
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    _DELIVERY_SELECT = (
+        "SELECT b.*, m.invalidated AS manifest_invalidated,"
+        " m.dataset_version AS manifest_version"
+        " FROM delivery_batches b"
+        " JOIN published_manifests m ON m.manifest_id = b.manifest_id"
+    )
+
+    def _delivery_row_to_dict(self, r, current_version: int) -> Dict[str, Any]:
+        # 清单失效（输入变动或版本不匹配）会传导到其所有批次
+        manifest_expired = (
+            bool(r["manifest_invalidated"]) or r["manifest_version"] != current_version
+        )
+        return {
+            "batch_id": r["batch_id"],
+            "manifest_id": r["manifest_id"],
+            "dataset_version": r["dataset_version"],
+            "created_at": r["created_at"],
+            "superseded": bool(r["superseded"]),
+            "superseded_at": r["superseded_at"],
+            "manifest_expired": manifest_expired,
+            "train": {
+                "count": r["train_count"],
+                "bytes": r["train_bytes"],
+                "sha256": r["train_sha256"],
+            },
+            "eval": {
+                "count": r["eval_count"],
+                "bytes": r["eval_bytes"],
+                "sha256": r["eval_sha256"],
+            },
+            "train_cases": json.loads(r["train_cases_json"]),
+            "eval_cases": json.loads(r["eval_cases_json"]),
+        }
+
+    def list_deliveries(self) -> List[Dict[str, Any]]:
+        current_version = self.get_version()
+        with self._lock:
+            rows = self._conn.execute(
+                self._DELIVERY_SELECT
+                + " ORDER BY b.created_at DESC, b.batch_id DESC"
+            ).fetchall()
+        return [self._delivery_row_to_dict(r, current_version) for r in rows]
+
+    def get_delivery(self, batch_id: str) -> Optional[Dict[str, Any]]:
+        current_version = self.get_version()
+        with self._lock:
+            r = self._conn.execute(
+                self._DELIVERY_SELECT + " WHERE b.batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+        if r is None:
+            return None
+        return self._delivery_row_to_dict(r, current_version)
+
+    def delivery_batch_ids(self) -> set:
+        """全部批次号（含已作旧），供启动时清理无记录的孤儿目录。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT batch_id FROM delivery_batches"
+            ).fetchall()
+        return {r["batch_id"] for r in rows}
 
     def version_log(self) -> List[Dict[str, Any]]:
         with self._lock:

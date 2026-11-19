@@ -26,6 +26,7 @@
   <button class="tab" data-tab="solve">③ 求解与发布</button>
   <button class="tab" data-tab="manifests">④ 已发布清单</button>
   <button class="tab" data-tab="log">⑤ 版本记录</button>
+  <button class="tab" data-tab="delivery">⑥ 特征打包与交付</button>
 </nav>
 
 <!-- ======================= Tab 1 数据 ======================= -->
@@ -175,6 +176,39 @@
     <table id="logTable"><thead>
       <tr><th>版本</th><th>变动类型</th><th>详情</th><th>时间 (UTC)</th></tr>
     </thead><tbody></tbody></table>
+  </div>
+</section>
+
+<!-- ======================= Tab 6 特征打包与交付 ======================= -->
+<section class="panel" id="tab-delivery">
+  <h2>1. 选择清单并上传特征 ZIP</h2>
+  <p class="hint">离线训练机与评估机<b>分开取数</b>：平台按所选清单把特征文件打成
+    <b>训练包</b>与<b>评估包</b>两个 ZIP，各附病例列表（cases.csv）与<b>同一个交付批次号</b>
+    （delivery_batch.json）。仅可选择<b>当前有效</b>的已发布清单。</p>
+  <p class="hint">ZIP 要求：根目录下每例一个 <code>病例号.json</code>（UTF-8 合法 JSON），
+    解压总量 ≤ 8 MiB。<b>缺件、未知病例或同名文件都整包拒收</b>。
+    两包都保存成功后才开放下载；打包期间仍可更正切分输入——若输入在打包期间变动，
+    本次打包失败，上一对有效包不受影响。</p>
+  <div class="row">
+    <select id="packManifest"></select>
+    <input type="file" id="featuresFile" accept=".zip,application/zip">
+    <button class="primary" onclick="packageDelivery()">校验并打包</button>
+  </div>
+  <div id="packMsg" class="msg"></div>
+  <div id="packResult" class="banner ok hidden"></div>
+
+  <h2>2. 交付批次</h2>
+  <p class="hint">同一清单重新打包成功后，旧批次链接立即提示失效；重新打包失败时上一对有效包仍可下载。
+    清单失效后，其所有批次一律不得下载。批次记录与 ZIP 文件持久化，重启后规则不变。</p>
+  <div class="table-wrap">
+    <table id="deliveryTable"><thead>
+      <tr><th>交付批次号</th><th>清单 ID</th><th>输入版本</th><th>创建时间 (UTC)</th>
+          <th>训练包</th><th>评估包</th><th>状态</th><th>操作</th></tr>
+    </thead><tbody></tbody></table>
+  </div>
+  <div id="deliveryDetail" class="hidden">
+    <h3>批次病例列表</h3>
+    <pre id="deliveryJson"></pre>
   </div>
 </section>
 

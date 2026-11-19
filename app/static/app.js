@@ -135,6 +135,7 @@ function renderState() {
   }
   renderLocks();
   renderManifestTable();
+  renderDeliverySection();
 }
 
 // --------------------------------------------------------------------------- //
@@ -385,6 +386,114 @@ async function loadVersionLog() {
       <td>${escapeHtml(e.created_at)}</td></tr>`).join("")
       || `<tr><td colspan="4" class="hint">暂无变动记录</td></tr>`;
   } catch (err) { /* 轮询场景静默 */ }
+}
+
+// --------------------------------------------------------------------------- //
+// 特征打包与交付
+// --------------------------------------------------------------------------- //
+async function packageDelivery() {
+  const manifestId = $("packManifest").value;
+  const f = $("featuresFile").files[0];
+  if (!manifestId) return setMsg("packMsg", "请选择一份有效的已发布清单");
+  if (!f) return setMsg("packMsg", "请选择特征 ZIP 文件");
+  const fd = new FormData();
+  fd.append("manifest_id", manifestId);
+  fd.append("file", f);
+  setMsg("packMsg", "校验并打包中…");
+  $("packResult").classList.add("hidden");
+  try {
+    const r = await api("/api/deliveries", { method: "POST", body: fd });
+    const b = r.batch;
+    setMsg("packMsg", `打包成功。${r.notice}`, true);
+    $("packResult").innerHTML =
+      `交付批次号（两包共用）：<code>${b.batch_id}</code>　` +
+      `训练包 ${b.train.count} 例（${(b.train.bytes / 1024).toFixed(1)} KiB）　` +
+      `评估包 ${b.eval.count} 例（${(b.eval.bytes / 1024).toFixed(1)} KiB）　` +
+      `<button onclick="downloadDelivery('${b.batch_id}','train')">下载训练包</button> ` +
+      `<button onclick="downloadDelivery('${b.batch_id}','eval')">下载评估包</button>`;
+    $("packResult").classList.remove("hidden");
+    $("featuresFile").value = "";
+    await refreshAll();
+  } catch (err) {
+    // 整包拒收或清单失效：不产生任何交付物，已有批次不受影响
+    setMsg("packMsg", err.message);
+    await refreshAll();
+  }
+}
+
+function renderDeliverySection() {
+  if (!currentState) return;
+  // 清单下拉：仅当前有效的清单可选
+  const sel = $("packManifest");
+  const prior = sel.value;
+  const valid = currentState.manifests.filter((m) => !m.expired);
+  sel.innerHTML = valid.length
+    ? valid.map((m) =>
+        `<option value="${m.manifest_id}">清单 ${m.manifest_id.slice(0, 8)}…` +
+        `（v${m.dataset_version}，${m.case_count ?? "?"} 例，${m.created_at}）</option>`).join("")
+    : `<option value="">（暂无有效清单，请先在 ③ 求解并发布）</option>`;
+  if (valid.some((m) => m.manifest_id === prior)) sel.value = prior;
+
+  const tbody = $("deliveryTable").querySelector("tbody");
+  const ds = currentState.deliveries || [];
+  if (!ds.length) {
+    tbody.innerHTML = `<tr><td colspan="8" class="hint">暂无交付批次</td></tr>`;
+    return;
+  }
+  const fmt = (p) => `${p.count} 例 / ${(p.bytes / 1024).toFixed(1)} KiB`;
+  tbody.innerHTML = ds.map((b) => {
+    const pill = b.downloadable
+      ? `<span class="pill ok">有效</span>`
+      : `<span class="pill dead">${escapeHtml(b.status)}</span>`;
+    return `<tr>
+      <td><code title="${b.batch_id}">${b.batch_id.slice(0, 8)}…</code></td>
+      <td><code title="${b.manifest_id}">${b.manifest_id.slice(0, 8)}…</code></td>
+      <td>v${b.dataset_version}</td>
+      <td>${escapeHtml(b.created_at)}</td>
+      <td>${fmt(b.train)}</td>
+      <td>${fmt(b.eval)}</td>
+      <td>${pill}</td>
+      <td>
+        <button onclick="downloadDelivery('${b.batch_id}','train')">训练包</button>
+        <button onclick="downloadDelivery('${b.batch_id}','eval')">评估包</button>
+        <button onclick="showDelivery('${b.batch_id}')">病例列表</button>
+      </td></tr>`;
+  }).join("");
+}
+
+async function downloadDelivery(batchId, pkg) {
+  // 服务端统一裁决：被替换 / 清单失效 / 文件缺失都会返回 409 并说明原因
+  const resp = await fetch(`/api/deliveries/${batchId}/download/${pkg}`);
+  if (!resp.ok) {
+    let msg = `下载被拒绝（HTTP ${resp.status}）`;
+    try { msg = (await resp.json()).detail || msg; } catch { /* ignore */ }
+    alert(msg);
+    await refreshAll();
+    return;
+  }
+  const blob = await resp.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${pkg}_features_batch_${batchId.slice(0, 8)}.zip`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function showDelivery(batchId) {
+  try {
+    const b = await api(`/api/deliveries/${batchId}`);
+    $("deliveryDetail").classList.remove("hidden");
+    $("deliveryJson").textContent = JSON.stringify({
+      batch_id: b.batch_id,
+      manifest_id: b.manifest_id,
+      status: b.status,
+      dataset_version: b.dataset_version,
+      created_at: b.created_at,
+      train_cases: b.train_cases,
+      eval_cases: b.eval_cases,
+    }, null, 2);
+  } catch (err) { alert(err.message); }
 }
 
 // --------------------------------------------------------------------------- //
